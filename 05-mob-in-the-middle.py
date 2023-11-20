@@ -103,10 +103,11 @@ class Server:
             log(writer, "7&] Added task callback")
         except:
             try:
-                log(writer, "8 ] Closing connection to server")
-                swriter.close()
-                await swriter.wait_closed()
-                log(writer, "8*] Closed connection to server")
+                if "swriter" in locals():
+                    log(writer, "8 ] Closing connection to server")
+                    swriter.close()
+                    await swriter.wait_closed()
+                    log(writer, "8*] Closed connection to server")
             except:
                 pass
 

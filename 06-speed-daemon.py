@@ -5,9 +5,6 @@ from datetime import datetime
 
 encoding = "utf-8"
 
-CLIENT_UNIDENTIFIED, CLIENT_CAMERA, CLIENT_DISPATCHER = range(3)
-HEARTBEAT_NOT_SET, HEARTBEAT_SET = range(2)
-
 
 def info(writer, *args, **kwargs):
     addr = writer.get_extra_info("peername")
@@ -27,34 +24,44 @@ def log2(*args, **kwargs):
 
 class Client:
     def __init__(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        loop: asyncio.AbstractEventLoop,
     ) -> None:
         self.reader = reader
         self.writer = writer
-        self.identity = CLIENT_UNIDENTIFIED
-        self.hearbeat = HEARTBEAT_NOT_SET
         self.tasks = set()
         self.closed = False
+        self.loop = loop
 
     async def close(self):
-        self.closed = True
-        try:
-            log(self.writer, "Awaiting closure")
-            self.writer.close()
-            await self.writer.wait_closed()
-            log(self.writer, "Connection closed")
-            # TODO: Delete all tasks
-        except:
-            pass
+        if not self.closed:
+            self.closed = True
+            addr = self.writer.get_extra_info("peername")
+            try:
+                log(self.writer, "Awaiting closure")
+                self.writer.close()
+                await self.writer.wait_closed()
+                log(self.writer, "Connection closed")
+            except:
+                pass
+
+            for task in self.tasks:
+                try:
+                    task.cancel()
+                    log2(addr, "Cancelled a task")
+                except:
+                    pass
 
 
-# Sends an error message to the client and also disconnects the client
-class ErrorHandler:
+# Sends an error message to the client and also disconnect the client
+class ErrorWriter:
     def __init__(self, client: Client) -> None:
         self.client = client
         self.writer = client.writer
 
-    async def handle(self, message: bytes, close_connection=True):
+    async def write(self, message: bytes, close_connection=True):
         try:
             length = len(message)
             if length > 255:
@@ -67,17 +74,16 @@ class ErrorHandler:
                     self.writer.close()
                     await self.writer.wait_closed()
                 except:
-                    # TODO Close all other tasks related to this client
-                    pass
+                    await self.client.close()
 
 
-class PlateHandler:
+class PlateReader:
     def __init__(self, client: Client) -> None:
         self.client = client
         self.reader = client.reader
 
     # Attempts to read a plate packet from the stream
-    async def handle(self):
+    async def read(self):
         plate_length = await self.reader.read(1)
         plate_length = plate_length[0]
         plate = await self.reader.readexactly(plate_length + 4)
@@ -90,7 +96,7 @@ class TicketWriter:
         self.client = client
         self.writer = client.writer
 
-    async def handle(
+    async def write(
         self,
         plate: bytes,
         road: int,
@@ -118,29 +124,51 @@ class TicketWriter:
         await self.writer.drain()
 
 
-class HeartBeatHandler:
+class HeartBeatReader:
     def __init__(self, client: Client) -> None:
         self.client = client
         self.reader = client.reader
 
-    """
-    Returns the hearbeat as integer in milliseconds
-    The client sends it in decisecond, one decisecond = 1/10 seconds
-    """
-
-    async def handle(self) -> int:
+    async def read(self) -> int:
         interval = await self.reader.readexactly(4)
-        return struct.unpack("!I", interval)[0] * 100
+        return struct.unpack("!I", interval)[0]
 
 
-class HeartBeatWriter:
-    def __init__(self, client: Client) -> None:
+class HeartBeatTask:
+    def __init__(self, client: Client, interval: int) -> None:  # In deciseconds
         self.client = client
         self.writer = client.writer
+        self.task = None
+        self.interval = interval
 
-    async def handle(self):
-        self.writer.write(bytearray([0x41]))
-        await self.writer.drain()
+    async def write(self):
+        # Exceptions inside a client can stop the main event loop from working
+        # So handle exceptions here
+        try:
+            while True:
+                log(self.client.writer, "Sending hearbeat to client")
+                self.writer.write(bytearray([0x41]))
+                await self.writer.drain()
+                await asyncio.sleep(self.interval / 10)
+        except:
+            log(
+                self.client.writer,
+                "Error while sending hearbeat ... closing connection",
+            )
+        finally:
+            await self.client.close()
+
+    async def start(self):
+        log(
+            self.client.writer,
+            f"Got a request to send hearbeat at interval: {self.interval/10}s",
+        )
+        if self.interval == 0:
+            return
+        log(self.client.writer, "Created hearbeat task")
+        self.task = self.client.loop.create_task(self.write())
+        self.client.tasks.add(self.task)
+        self.task.add_done_callback(self.client.tasks.discard)
 
 
 class CameraHandler:
@@ -148,20 +176,38 @@ class CameraHandler:
         self.reader = client.reader
         self.client = client
         self.readers = {
-            # OP code   # Handler
-            0x20: PlateHandler,
-            0x40: HeartBeatHandler,
+            # OP code   # Reader
+            0x20: PlateReader,
+            0x40: HeartBeatReader,
         }
 
     async def handle(self):
         log(self.client.writer, "The client has identified itself as a camera")
         data = await self.reader.readexactly(6)
         road, mile, limit = struct.unpack("!HHH", data)
-        log(self.client.writer, f"Camera {road: {road}, mile: {mile}, limit: {limit}}")
+        log(
+            self.client.writer, f"Camera {{road: {road}, mile: {mile}, limit: {limit}}}"
+        )
         while True:
             # The client has identified itself as a camera
             # The client can send only WantHeartbeat and Plate messages
-            pass
+            opcode = await self.reader.read(1)
+            if opcode:
+                opcode = opcode[0]
+                instance = self.readers[opcode](self.client)
+                # We have gotten a plate
+                parsed = await instance.read()
+                if opcode == 0x20:
+                    pass
+                if opcode == 0x40:
+                    # Remove the heart beat reader from self.readers
+                    # So that any more heart beat requests from this client will be an error
+                    del self.readers[0x40]
+                    await HeartBeatTask(self.client, parsed).start()
+            else:
+                # The client disconnected
+                log(self.client.writer, "Disconnected")
+                return
 
 
 class DispatcherHandler:
@@ -188,18 +234,17 @@ class SpeedDaemonServer:
     async def handle_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ):
-        client = Client(reader, writer)
+        client = Client(reader, writer, self.loop)
         try:
             opcode = await reader.read(1)
             if opcode:
                 opcode = opcode[0]
                 instance = self.handlers[opcode](client)
-                while True:
-                    await instance.handle()
+                await instance.handle()
         except Exception as e:
             log(writer, f"ERROR: {traceback.format_exc()}")
             try:
-                await ErrorHandler(client).handle(
+                await ErrorWriter(client).write(
                     traceback.format_exc()[:254].encode("utf-8"), close_connection=False
                 )
             except Exception as e:
