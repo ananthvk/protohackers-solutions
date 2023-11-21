@@ -1,4 +1,5 @@
 import os
+import math
 from collections import deque 
 
 os.environ["PYTHONASYNCIODEBUG"] = "1"
@@ -16,6 +17,8 @@ dispatchers = dict()
 plates = dict()
 # Ticket queue: road -> ticket (as bytes)
 tickets = dict()
+# last ticket sent
+last_ticket = dict()
 encoding = "utf-8"
 
 
@@ -77,8 +80,7 @@ class ErrorWriter:
     async def write(self, message: bytes, close_connection=True):
         try:
             length = len(message)
-            if length > 255:
-                raise SystemExit("Logic error: Server sent message of length > 255")
+            log(self.writer, "Sending error message: ", message.decode('utf-8'))
             self.writer.write(struct.pack(f"!BB{length}s", 0x10, length, message))
             await self.writer.drain()
         finally:
@@ -120,6 +122,7 @@ class TicketWriter:
         speed: int,
     ) -> None:
         plate_length = len(plate)
+        log(self.writer, f"Writing ticket: {plate_length} {plate} {road} {mile1} {timestamp1} {mile2} {timestamp2} {int(speed*100)}")
         self.writer.write(
             struct.pack(
                 f"!BB{plate_length}sHHIHIH",
@@ -218,62 +221,78 @@ class CameraHandler:
             # The client has identified itself as a camera
             # The client can send only WantHeartbeat and Plate messages
             opcode = await self.reader.read(1)
-            if opcode:
-                opcode = opcode[0]
-                instance = self.readers[opcode](self.client)
-                # We have gotten a plate
-                parsed = await instance.read()
-                if opcode == 0x20:
-                    plate = parsed[0]
-                    timestamp = parsed[1]
-                    log(self.client.writer, f"Got Plate {{{plate} at {timestamp}}}")
-                    if plates.get(plate) is None:
-                        # This is the first plate we have received
-                        plates[plate] = [(mile, timestamp)]
-                    else:
-                        plates[plate].append((mile, timestamp))
-                        plates[plate].sort()
-                        log(self.client.writer, f"There is information about the client, checking if a ticket is needed")
-                        for i in range(1, len(plates[plate])):
-                            # Check adjacent observations
-                            mile2 = plates[plate][i][0] 
-                            mile1 = plates[plate][i-1][0]
-                            timestamp2 = plates[plate][i][1] 
-                            timestamp1 = plates[plate][i-1][1]
-                            distance =  mile2 - mile1 
-                            t = timestamp2 - timestamp1 
-                            v = (distance/t)*60*60 # Convert miles/s to miles/h
-                            if abs(v) - limit >= 0.5:
-                                # The client was overspeeding
-                                log(self.client.writer, f"{plate} was overspeeding with speed {v}")
-                                road_dispatchers = dispatchers.get(road)
-                                ticket = None #TODO
-
-                                if road_dispatchers is None:
-                                    # There are no active dispatchers for this road, wait for a one to connect
-                                    log(self.client.writer, f"There are no active dispatchers for {road}, waiting")
-                                    if tickets.get(road) is None:
-                                        tickets[road] = deque()
-                                    tickets[road].append((plate, road, mile1, timestamp1, mile2, timestamp2, v))
-                                else:
-                                    for dispatcher in road_dispatchers:
-                                        if not dispatcher.client.closed:
-                                            # Send the ticket
-                                            log(self.client.writer, f"There was an active dispatcher, sending ticket")
-                                            await TicketWriter(dispatcher.client).write(plate, road, mile1, timestamp1, mile2, timestamp2, v)
-                                        
-                                        
-                                
-
-                if opcode == 0x40:
-                    # Remove the heart beat reader from self.readers
-                    # So that any more heart beat requests from this client will be an error
-                    del self.readers[0x40]
-                    await HeartBeatTask(self.client, parsed).start()
-            else:
+            if not opcode;
                 # The client disconnected
                 log(self.client.writer, "Disconnected")
                 return
+            opcode = opcode[0]
+            instance = self.readers[opcode](self.client)
+            # We have gotten a plate
+            parsed = await instance.read()
+            if opcode == 0x40:
+                # Remove the heart beat reader from self.readers
+                # So that any more heart beat requests from this client will be an error
+                del self.readers[0x40]
+                await HeartBeatTask(self.client, parsed).start()
+            if opcode == 0x20:
+                plate = parsed[0]
+                timestamp = parsed[1]
+                log(self.client.writer, f"Got Plate {{{plate} at {timestamp}}}")
+                if plates.get(plate) is None:
+                    # This is the first plate we have received
+                    plates[plate] = [(mile, timestamp)]
+                else:
+                    plates[plate].append((mile, timestamp))
+                    plates[plate].sort()
+                    log(self.client.writer, f"There is information about the client, checking if a ticket is needed")
+                    for i in range(1, len(plates[plate])):
+                        # Check adjacent observations
+                        mile2 = plates[plate][i][0] 
+                        mile1 = plates[plate][i-1][0]
+                        timestamp2 = plates[plate][i][1] 
+                        timestamp1 = plates[plate][i-1][1]
+                        
+                        if timestamp1 > timestamp2:
+                            # Swap everything
+                            mile1, mile2 = mile2, mile1
+                            timestamp2, timestamp1 = timestamp1, timestamp2
+
+                        distance =  mile2 - mile1 
+                        t = timestamp2 - timestamp1 
+                        v = abs((distance/t)*60*60) # Convert miles/s to miles/h
+                        if v - limit >= 0.5:
+                            # The client was overspeeding
+                            log(self.client.writer, f"{plate} was overspeeding with speed {v} on road {road}")
+                            road_dispatchers = dispatchers.get(road)
+
+                            if road_dispatchers is None:
+                                # There are no active dispatchers for this road, wait for a one to connect
+                                log(self.client.writer, f"There are no active dispatchers for {road}, waiting to send ticket to {plate}")
+                                if tickets.get(road) is None:
+                                    tickets[road] = deque()
+                                tickets[road].append((plate, road, mile1, timestamp1, mile2, timestamp2, v))
+                            else:
+                                today = math.floor(timestamp / 86400)
+                                if last_ticket.get(plate, -1) == today:
+                                    # Do not send the ticket as we have already dispatched it
+                                    log(self.client.writer, f"A ticket was already sent to {plate} on {road} for this day {today}, last: {last_ticket.get(plate, -1)}")
+                                    pass
+                                else:
+                                    not_sent = True
+                                    for dispatcher in road_dispatchers:
+                                        if not dispatcher.closed:
+                                            # Send the ticket
+                                            last_ticket[plate] = today
+                                            log(self.client.writer, f"There was an active dispatcher, sending ticket to {plate}, {road}")
+                                            await TicketWriter(dispatcher).write(plate, road, mile1, timestamp1, mile2, timestamp2, v)
+                                            not_sent = False
+                                            break
+                                    if not_sent:
+                                        # There are no active dispatchers for this road, wait for a one to connect
+                                        log(self.client.writer, f"There are no open dispatchers for {road}, waiting to send ticket to {plate}")
+                                        if tickets.get(road) is None:
+                                            tickets[road] = deque()
+                                        tickets[road].append((plate, road, mile1, timestamp1, mile2, timestamp2, v))
 
 
 class DispatcherHandler:
@@ -361,7 +380,7 @@ class SpeedDaemonServer:
             log(writer, f"ERROR: {traceback.format_exc()}")
             try:
                 await ErrorWriter(client).write(
-                    traceback.format_exc()[:254].encode("utf-8"), close_connection=False
+                    traceback.format_exc().encode("utf-8"), close_connection=False
                 )
             except Exception as e:
                 log(writer, "ERROR: error writing error message")
