@@ -34,6 +34,7 @@ async def main():
     dreader, dwriter = await asyncio.open_connection("127.0.0.1", 8000)
     # Dispatcher client
     dwriter.write(bytearray([0x81, 0x01, 0x00, 0x7b]))
+    dwriter.write(bytearray([0x81, 0x01, 0x00, 0x7b]))
     await asyncio.sleep(10)
     await dwriter.drain()
     dwriter.close()

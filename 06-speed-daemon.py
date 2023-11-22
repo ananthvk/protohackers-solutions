@@ -90,7 +90,7 @@ class ErrorWriter:
 
     async def write(self, message: bytes, close_connection=True):
         try:
-            length = len(message)
+            length = min(len(message), 254)
             log(self.writer, "Sending error message: ", message.decode('utf-8'))
             self.writer.write(struct.pack(f"!BB{length}s", 0x10, length, message))
             await self.writer.drain()
@@ -113,6 +113,7 @@ class PlateReader:
         plate = await self.reader.readexactly(plate_length + 4)
         plate, timestamp = struct.unpack(f"!{plate_length}sI", plate)
         return plate, timestamp
+
 class TicketPacker:
     def __init__(self, client: Client) -> None:
         self.client = client
@@ -173,6 +174,7 @@ class HeartBeatTask:
                 "Error while sending hearbeat ... closing connection",
                 traceback.format_exc(),
             )
+            await ErrorWriter(self.client).write(b"Error sending hearbeat")
         finally:
             await self.client.close()
 
@@ -243,12 +245,15 @@ class PlateHandler:
         plates[plate] = plates.get(plate, []) + [(mile, timestamp)]
         plates[plate].sort()
         log(self.client.writer, f"There is information about the client, checking if a ticket is needed")
-        for i in range(1, len(plates[plate])):
+        # for i in range(1, len(plates[plate])):
+        for pair in itertools.combinations(range(len(plates[plate])), 2):
             # Check adjacent observations
+            i = pair[0]
+            j = pair[1]
             mile2 = plates[plate][i][0] 
-            mile1 = plates[plate][i-1][0]
+            mile1 = plates[plate][j][0]
             timestamp2 = plates[plate][i][1] 
-            timestamp1 = plates[plate][i-1][1]
+            timestamp1 = plates[plate][j][1]
             
             if timestamp1 > timestamp2:
                 # Swap if the car is travelling in the opposite direction
@@ -362,6 +367,8 @@ class DispatcherHandler:
                     # The client disconnected
                     log(self.client.writer, "Disconnected")
                     return
+        except:
+            await ErrorWriter(self.client).write(b"Error handling dispatcher")
         finally:
             await self.client.close()
             # for road in roads: # type: ignore
