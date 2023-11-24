@@ -211,81 +211,123 @@ class JobManager:
         return True
 
 
-job_manager = JobManager()
+class Server:
+    def __init__(self) -> None:
+        # Dictionary of a client address with the jobs it has requested using GET
+        self.clients: Dict[str, set] = dict()
+        self.job_manager = JobManager()
 
+    async def handle_put(
+        self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
+    ):
+        jsonschema.validate(instance=instance, schema=put_schema)
+        job = self.job_manager.put(instance["queue"], instance["job"], instance["pri"])
+        writer.write(b'{"status":"ok","id":%d}\n' % job.job_id)
 
-async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    address = ""
-    try:
-        address = writer.get_extra_info("peername")
-        address = f"{address[0]}:{address[1]}"
-        logger.info("%s connected", address)
-        while True:
-            data = await reader.readline()
-            if not data:
-                logger.info("%s disconnected", address)
-                break
-            logger.info("%s sent %s", address, data)
+    async def handle_get(
+        self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
+    ):
+        jsonschema.validate(instance=instance, schema=get_schema)
+        job = self.job_manager.get(instance["queues"])
+        if job is None:
+            writer.write(b'{"status":"no-job"}\n')
+        else:
+            self.clients[address].add(job.job_id)
+            job_as_json = json.dumps(job.job).encode("utf-8")
+            writer.write(
+                b'{"status":"ok","id":%d,"job":%s,"pri":123,"queue":"%s"}\n'
+                % (job.job_id, job_as_json, job.queue.encode("utf-8"))
+            )
 
-            # Load and validate the data
-            try:
-                instance = json.loads(data)
-                jsonschema.validate(instance=instance, schema=request_schema)
-                # Instance is a valid request and has a request field
-                if instance["request"] == "get":
-                    jsonschema.validate(instance=instance, schema=get_schema)
-                    job = job_manager.get(instance["queues"])
-                    if job is None:
-                        writer.write(b'{"status":"no-job"}\n')
-                    else:
-                        job_as_json = json.dumps(job.job).encode('utf-8')
-                        writer.write(
-                            b'{"status":"ok","id":%d,"job":%s,"pri":123,"queue":"%s"}\n'
-                            % (job.job_id, job_as_json, job.queue.encode('utf-8'))
-                        )
+    async def handle_delete(
+        self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
+    ):
+        jsonschema.validate(instance=instance, schema=abort_delete_schema)
+        status = self.job_manager.delete(instance["id"])
+        if not status:
+            writer.write(b'{"status":"no-job"}\n')
+        else:
+            writer.write(b'{"status":"ok"}\n')
 
-                elif instance["request"] == "put":
-                    jsonschema.validate(instance=instance, schema=put_schema)
-                    job = job_manager.put(
-                        instance["queue"], instance["job"], instance["pri"]
-                    )
-                    writer.write(b'{"status":"ok","id":%d}\n' % job.job_id)
+    async def handle_abort(
+        self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
+    ):
+        jsonschema.validate(instance=instance, schema=abort_delete_schema)
+        if instance["id"] not in self.clients[address]:
+            writer.write(
+                b'{"status": "error", "error": "The client did not get the job before"}\n'
+            )
+        else:
+            status = self.job_manager.abort(instance["id"])
+            if not status:
+                writer.write(b'{"status":"no-job"}\n')
+            else:
+                writer.write(b'{"status":"ok"}\n')
 
-                else:
-                    jsonschema.validate(instance=instance, schema=abort_delete_schema)
-                    if instance["request"] == "delete":
-                        status = job_manager.delete(instance["id"])
-                        if not status:
-                            writer.write(b'{"status":"no-job"}\n')
-                        else:
-                            writer.write(b'{"status":"ok"}\n')
-                    else:
-                        status = job_manager.abort(instance["id"])
-                        if not status:
-                            writer.write(b'{"status":"no-job"}\n')
-                        else:
-                            writer.write(b'{"status":"ok"}\n')
+    async def accept_client(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
+        address = ""
+        try:
+            address = writer.get_extra_info("peername")
+            address = f"{address[0]}:{address[1]}"
+            logger.info("%s connected", address)
+            self.clients[address] = set()
+            while True:
+                if not (await self.process_client(address, reader, writer)):
+                    break
+        except:
+            logger.exception("%s error occured while handling client", address)
+        finally:
+            await self.close_client(address, writer)
 
-            except ValidationError as e:
-                logger.warning("%s invalid request: %s", address, e.message)
-                writer.write(
-                    b'{"status": "error", "error": "%s"}\n' % e.message.encode("utf-8")
-                )
-            except json.JSONDecodeError as e:
-                logger.warning("%s illformated json: %s", address, e.msg)
-                writer.write(
-                    b'{"status": "error", "error": "%s"}\n' % e.msg.encode("utf-8")
-                )
+    async def process_client(
+        self, address: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ):
+        data = await reader.readline()
+        if not data:
+            logger.info("%s disconnected", address)
+            return False
+        logger.info("%s sent %s", address, data)
+        # Load and validate the data
+        try:
+            instance = json.loads(data)
+            jsonschema.validate(instance=instance, schema=request_schema)
+            # Instance is a valid request and has a request field
+            if instance["request"] == "get":
+                await self.handle_get(address, writer, instance)
+            elif instance["request"] == "put":
+                await self.handle_put(address, writer, instance)
+            elif instance["request"] == "delete":
+                await self.handle_delete(address, writer, instance)
+            else:
+                await self.handle_abort(address, writer, instance)
+        except ValidationError as e:
+            logger.warning("%s invalid request: %s", address, e.message)
+            writer.write(
+                b'{"status": "error", "error": "%s"}\n' % e.message.encode("utf-8")
+            )
+        except json.JSONDecodeError as e:
+            logger.warning("%s illformated json: %s", address, e.msg)
+            writer.write(
+                b'{"status": "error", "error": "%s"}\n' % e.msg.encode("utf-8")
+            )
+        except Exception as e:
+            logger.critical("%s unhandled exception", address, exc_info=1)  # type: ignore
+            writer.write(b'{"status": "error", "error": "unhandled exception"}\n')
 
-            except Exception as e:
-                logger.critical("%s unhandled exception", address, exc_info=1)  # type: ignore
-                writer.write(b'{"status": "error", "error": "unhandled exception"}\n')
+        await writer.drain()
+        return True
 
-            await writer.drain()
-    except:
-        logger.exception("%s error occured while handling client", address)
-
-    finally:
+    async def close_client(self, address: str, writer: asyncio.StreamWriter):
+        try:
+            logger.info("%s clearing all jobs of this client", address)
+            # When the client disconnects, abort all running jobs of this client
+            for job in self.clients[address]:
+                self.job_manager.abort(job)
+            del self.clients[address]
+        except:
+            pass
         try:
             writer.close()
             await writer.wait_closed()
@@ -300,7 +342,8 @@ async def main():
     loop.set_debug(True)
     logging.getLogger("asyncio").setLevel(logging.DEBUG)
     logger.info("This is from logger")
-    server = await asyncio.start_server(client_handler, host=HOST, port=PORT)
+    job_server = Server()
+    server = await asyncio.start_server(job_server.accept_client, host=HOST, port=PORT)
     logger.info("Started server on %s:%d", HOST, PORT)
     async with server:
         await server.serve_forever()
