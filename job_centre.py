@@ -173,31 +173,33 @@ class JobManager:
             return None
 
         return heapq.heappop(self.queues[highest_priority_job.queue])
-
-    def delete(self, job_id: int):
+    
+    def is_valid(self, job_id: int):
         """
-        Returns True if the delete is valid
-        False otherwise
+        Returns True if this is a valid job id
         """
-        # Check if the job has already been deleted
-        if job_id not in self.jobs:
-            return False
-
-        # Check if the job id has not been allocated
-        if job_id > self.job_id_counter:
-            return False
-
-        self.jobs[job_id].deleted = True
-        del self.jobs[job_id]
-        return True
-
-    def abort(self, job_id: int):
         # Check if the job has been deleted
         if job_id not in self.jobs:
             return False
 
         # Check if the job id has not been allocated
         if job_id > self.job_id_counter:
+            return False
+        return True
+
+    def delete(self, job_id: int):
+        """
+        Returns True if the delete is valid
+        False otherwise
+        """
+        if not self.is_valid(job_id):
+            return False
+        self.jobs[job_id].deleted = True
+        del self.jobs[job_id]
+        return True
+
+    def abort(self, job_id: int):
+        if not self.is_valid(job_id):
             return False
 
         job = self.jobs[job_id]
@@ -229,15 +231,19 @@ class Server:
     ):
         jsonschema.validate(instance=instance, schema=get_schema)
         job = self.job_manager.get(instance["queues"])
-        if job is None:
-            writer.write(b'{"status":"no-job"}\n')
-        else:
+        if job is not None:
             self.clients[address].add(job.job_id)
             job_as_json = json.dumps(job.job).encode("utf-8")
             writer.write(
                 b'{"status":"ok","id":%d,"job":%s,"pri":123,"queue":"%s"}\n'
                 % (job.job_id, job_as_json, job.queue.encode("utf-8"))
             )
+            return
+        if instance.get('wait', False):
+            # The client has asked the server not to respond until a job appears
+            pass
+        else:
+            writer.write(b'{"status":"no-job"}\n')
 
     async def handle_delete(
         self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
@@ -253,16 +259,22 @@ class Server:
         self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
     ):
         jsonschema.validate(instance=instance, schema=abort_delete_schema)
+        # Check if this is a valid job id
+        if not self.job_manager.is_valid(instance["id"]):
+            writer.write(b'{"status":"no-job"}\n')
+            return
+
         if instance["id"] not in self.clients[address]:
             writer.write(
-                b'{"status": "error", "error": "The client did not get the job before"}\n'
+                b'{"status": "error", "error": "Only the client which requested this job can abort it"}\n'
             )
+            return
+
+        status = self.job_manager.abort(instance["id"])
+        if not status:
+            writer.write(b'{"status":"no-job"}\n')
         else:
-            status = self.job_manager.abort(instance["id"])
-            if not status:
-                writer.write(b'{"status":"no-job"}\n')
-            else:
-                writer.write(b'{"status":"ok"}\n')
+            writer.write(b'{"status":"ok"}\n')
 
     async def accept_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
