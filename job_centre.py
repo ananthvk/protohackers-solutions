@@ -381,5 +381,4 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 
-# TODO: Implement wait in get request, refactor the requests to reduce that many if-elses
-# TODO: Associate a client with abort and get requests
+# Execute with pypy3 to avoid timeout in the big test
