@@ -1,7 +1,26 @@
+import os
+import sys
+import traceback
+
+os.environ["PYTHONASYNCIODEBUG"] = "1"
+import logging
 import jsonschema
+import asyncio
 import heapq
 from jsonschema.exceptions import ValidationError
 from typing import Any, Dict, Set, Tuple
+import coloredlogs
+
+HOST = "0.0.0.0"
+PORT = 8000
+
+logger = logging.getLogger(name="job")
+coloredlogs.install(
+    level="DEBUG",
+    # logger=logger, # Enable this to only pass logs from this logger instance
+    milliseconds=True,
+    fmt="%(asctime)s %(name)-8s [%(levelname)-9s] %(funcName)-8s %(message)s",
+)
 
 put_schema = {
     "$schema": "http://json-schema.org/draft-04/schema",
@@ -55,9 +74,11 @@ request_schema = {
     "required": ["request"],
 }
 
+
 class Job:
     def __init__(
-        self, job_id: int, job: Dict[Any, Any], priority: int,  queue: str) -> None:
+        self, job_id: int, job: Dict[Any, Any], priority: int, queue: str
+    ) -> None:
         self.job_id = job_id
         self.job = job
         self.queue = queue
@@ -79,10 +100,12 @@ class Job:
         """
         return self.priority > other.priority
 
+
 class JobManager:
     """
     Manages jobs and their queues
     """
+
     def __init__(self) -> None:
         # Associates a queue name (string) with a heap(implemented as a list)
         self.queues: Dict[str, list[Job]] = dict()
@@ -92,12 +115,12 @@ class JobManager:
 
         # This counter starts from one and is incremented after a job is added
         self.job_id_counter = -1
-    
-    def _create_job(self, job: Dict[Any, Any], priority: int,  queue: str) -> Job:
+
+    def _create_job(self, job: Dict[Any, Any], priority: int, queue: str) -> Job:
         self.job_id_counter += 1
         return Job(self.job_id_counter, job, priority, queue)
 
-    def put(self , queue_name: str, job_dict: Dict[Any, Any], priority: int) -> Job:
+    def put(self, queue_name: str, job_dict: Dict[Any, Any], priority: int) -> Job:
         """
         Puts the job on the specified queue and returns the job object
         """
@@ -111,9 +134,9 @@ class JobManager:
         self.jobs[job.job_id] = job
         return job
 
-    def get(self , queues_list: list[str]):
+    def get(self, queues_list: list[str]):
         """
-        Returns the job with the highest priority among all the 
+        Returns the job with the highest priority among all the
         given queues. If no job is found, None is returned
         """
         # TODO: Check for deleted jobs
@@ -132,22 +155,22 @@ class JobManager:
 
                 # Loop until the first non deleted job is found
                 while job.deleted:
-                    if not self.queues[queue]: # The queue is empty
+                    if not self.queues[queue]:  # The queue is empty
                         # del self.queues[queue]
                         flag = True
                         break
                     job = heapq.heappop(self.queues[queue])
-                
+
                 if flag:
                     continue
 
                 if job.priority > highest_priority:
                     highest_priority = job.priority
                     highest_priority_job = job
-                
+
                 # Push the job back into the queue
                 heapq.heappush(self.queues[queue], job)
-        
+
         if highest_priority_job is None:
             return None
 
@@ -161,7 +184,7 @@ class JobManager:
         # Check if the job has already been deleted
         if job_id not in self.jobs:
             return False
-        
+
         # Check if the job id has not been allocated
         if job_id > self.job_id_counter:
             return False
@@ -178,7 +201,7 @@ class JobManager:
         # Check if the job id has not been allocated
         if job_id > self.job_id_counter:
             return False
-        
+
         job = self.jobs[job_id]
         job.running = False
 
@@ -188,3 +211,41 @@ class JobManager:
             self.queues[job.queue] = []
         heapq.heappush(self.queues[job.queue], job)
         return True
+
+
+async def client_accepted(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        address = writer.get_extra_info("peername")
+        address = f'{address[0]}:{address[1]}'
+        logger.info("%s connected", address)
+        while True:
+            data = await reader.readline()
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except:
+        print("ERROR: ", traceback.format_exc())
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except:
+            pass
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+
+    # Set asyncio debug
+    loop.set_debug(True)
+    logging.getLogger("asyncio").setLevel(logging.DEBUG)
+    logger.info("This is from logger")
+    server = await asyncio.start_server(client_accepted, host=HOST, port=PORT)
+    logger.info("Started server on %s:%d", HOST, PORT)
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

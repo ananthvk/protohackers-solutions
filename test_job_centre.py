@@ -96,3 +96,17 @@ def test_complete_delete(manager: JobManager):
     assert(manager.get(["1", "2", "3", "4"]) is None)
     for k, v in manager.queues.items():
         assert(not v)
+
+def test_abort(manager: JobManager):
+    job = manager.get(["4"])
+    assert(job is not None)
+    assert(manager.abort(job.job_id))
+
+    job2 = manager.get(["4"])
+    assert(job is not None)
+    assert(job == job2)
+
+    manager.delete(7)
+    assert(not manager.abort(job.job_id))
+    job3 = manager.get(["4"])
+    assert (job3 != job2)
