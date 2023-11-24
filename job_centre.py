@@ -55,12 +55,6 @@ request_schema = {
     "required": ["request"],
 }
 
-# This counter starts from one and is incremented after a job is added
-# Since this application uses asyncio with single threading, there is no need to lock
-# this counter.
-job_id_counter = -1
-
-
 class Job:
     def __init__(
         self, job_id: int, job: Dict[Any, Any], priority: int,  queue: str) -> None:
@@ -70,12 +64,6 @@ class Job:
         self.priority = priority
         self.running = False
         self.deleted = False
-
-    @staticmethod
-    def create(job: Dict[Any, Any], priority: int, queue: str) -> "Job":
-        global job_id_counter  # Add this line
-        job_id_counter += 1
-        return Job(job_id_counter, job, priority, queue)
 
     def __str__(self) -> str:
         return f"< Job {self.job_id} of {self.queue} [{self.priority}]>"
@@ -91,9 +79,9 @@ class Job:
         """
         return self.priority > other.priority
 
-class State:
+class JobManager:
     """
-    A class which holds global state required for this application
+    Manages jobs and their queues
     """
     def __init__(self) -> None:
         # Associates a queue name (string) with a heap(implemented as a list)
@@ -102,94 +90,101 @@ class State:
         # Dictionary of jobs, job_id: job
         self.jobs: Dict[int, Job] = dict()
 
-def put(state: State, queue_name: str, job_dict: Dict[Any, Any], priority: int) -> Job:
-    """
-    Puts the job on the specified queue and returns the job object
-    """
-
-    if queue_name not in state.queues:
-        # Create an empty job queue
-        state.queues[queue_name] = []
-
-    job = Job.create(job_dict, priority, queue_name)
-    heapq.heappush(state.queues[queue_name], job)
-    state.jobs[job.job_id] = job
-    return job
-
-def get(state: State, queues_list: list[str]):
-    """
-    Returns the job with the highest priority among all the 
-    given queues. If no job is found, None is returned
-    """
-    # TODO: Check for deleted jobs
-
-    if queues_list is None:
-        return None
-
-    highest_priority: int = -1
-    highest_priority_job: Job | None = None
-    for queue in queues_list:
-        # Check if the queue exists and is not empty
-        if queue in state.queues and state.queues[queue]:
-            # Find the element with highest priority in this queue
-            job = heapq.heappop(state.queues[queue])
-            flag = False
-
-            # Loop until the first non deleted job is found
-            while job.deleted:
-                if not state.queues[queue]: # The queue is empty
-                    del state.queues[queue]
-                    flag = True
-                    break
-                job = heapq.heappop(state.queues[queue])
-            
-            if flag:
-                break
-
-            if job.priority > highest_priority:
-                highest_priority = job.priority
-                highest_priority_job = job
-            
-            # Push the job back into the queue
-            heapq.heappush(state.queues[queue], job)
+        # This counter starts from one and is incremented after a job is added
+        self.job_id_counter = -1
     
-    if highest_priority_job is None:
-        return None
+    def _create_job(self, job: Dict[Any, Any], priority: int,  queue: str) -> Job:
+        self.job_id_counter += 1
+        return Job(self.job_id_counter, job, priority, queue)
 
-    return heapq.heappop(state.queues[highest_priority_job.queue])
+    def put(self , queue_name: str, job_dict: Dict[Any, Any], priority: int) -> Job:
+        """
+        Puts the job on the specified queue and returns the job object
+        """
 
-def delete(state: State, job_id: int):
-    """
-    Returns True if the delete is valid
-    False otherwise
-    """
-    # Check if the job has already been deleted
-    if job_id not in state.jobs:
-        return False
-    
-    # Check if the job id has not been allocated
-    if job_id > job_id_counter:
-        return False
+        if queue_name not in self.queues:
+            # Create an empty job queue
+            self.queues[queue_name] = []
 
-    state.jobs[job_id].deleted = True
-    del state.jobs[job_id]
-    return True
+        job = self._create_job(job_dict, priority, queue_name)
+        heapq.heappush(self.queues[queue_name], job)
+        self.jobs[job.job_id] = job
+        return job
 
-def abort(state: State, job_id: int):
-    # Check if the job has been deleted
-    if job_id not in state.jobs:
-        return False
+    def get(self , queues_list: list[str]):
+        """
+        Returns the job with the highest priority among all the 
+        given queues. If no job is found, None is returned
+        """
+        # TODO: Check for deleted jobs
 
-    # Check if the job id has not been allocated
-    if job_id > job_id_counter:
-        return False
-    
-    job = state.jobs[job_id]
-    job.running = False
+        if queues_list is None:
+            return None
 
-    # Put the job back in its queue
-    if job.queue not in state.queues:
-        # Create an empty job queue
-        state.queues[job.queue] = []
-    heapq.heappush(state.queues[job.queue], job)
-    return True
+        highest_priority: int = -1
+        highest_priority_job: Job | None = None
+        for queue in queues_list:
+            # Check if the queue exists and is not empty
+            if queue in self.queues and self.queues[queue]:
+                # Find the element with highest priority in this queue
+                job = heapq.heappop(self.queues[queue])
+                flag = False
+
+                # Loop until the first non deleted job is found
+                while job.deleted:
+                    if not self.queues[queue]: # The queue is empty
+                        # del self.queues[queue]
+                        flag = True
+                        break
+                    job = heapq.heappop(self.queues[queue])
+                
+                if flag:
+                    continue
+
+                if job.priority > highest_priority:
+                    highest_priority = job.priority
+                    highest_priority_job = job
+                
+                # Push the job back into the queue
+                heapq.heappush(self.queues[queue], job)
+        
+        if highest_priority_job is None:
+            return None
+
+        return heapq.heappop(self.queues[highest_priority_job.queue])
+
+    def delete(self, job_id: int):
+        """
+        Returns True if the delete is valid
+        False otherwise
+        """
+        # Check if the job has already been deleted
+        if job_id not in self.jobs:
+            return False
+        
+        # Check if the job id has not been allocated
+        if job_id > self.job_id_counter:
+            return False
+
+        self.jobs[job_id].deleted = True
+        del self.jobs[job_id]
+        return True
+
+    def abort(self, job_id: int):
+        # Check if the job has been deleted
+        if job_id not in self.jobs:
+            return False
+
+        # Check if the job id has not been allocated
+        if job_id > self.job_id_counter:
+            return False
+        
+        job = self.jobs[job_id]
+        job.running = False
+
+        # Put the job back in its queue
+        if job.queue not in self.queues:
+            # Create an empty job queue
+            self.queues[job.queue] = []
+        heapq.heappush(self.queues[job.queue], job)
+        return True
