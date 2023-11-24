@@ -3,10 +3,11 @@ import json
 
 os.environ["PYTHONASYNCIODEBUG"] = "1"
 import logging
-import jsonschema
+# import jsonschema
+# from jsonschema.exceptions import ValidationError
 import asyncio
 import heapq
-from jsonschema.exceptions import ValidationError
+import fastjsonschema 
 from typing import Any, Dict, Set, Tuple
 import coloredlogs
 
@@ -15,7 +16,7 @@ PORT = 8000
 
 logger = logging.getLogger(name="job")
 coloredlogs.install(
-    level="DEBUG",
+    level="CRITICAL",
     # logger=logger, # Enable this to only pass logs from this logger instance
     milliseconds=True,
     fmt="%(asctime)s %(name)-8s [%(levelname)-9s] %(funcName)-8s %(message)s",
@@ -73,6 +74,10 @@ request_schema = {
     "required": ["request"],
 }
 
+put_schema_validator = fastjsonschema.compile(put_schema)
+get_schema_validator = fastjsonschema.compile(get_schema)
+abort_delete_schema_validator = fastjsonschema.compile(abort_delete_schema)
+request_schema_validator = fastjsonschema.compile(request_schema)
 
 class Job:
     def __init__(
@@ -222,33 +227,45 @@ class Server:
     async def handle_put(
         self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
     ):
-        jsonschema.validate(instance=instance, schema=put_schema)
+        put_schema_validator(instance) # type: ignore
         job = self.job_manager.put(instance["queue"], instance["job"], instance["pri"])
         writer.write(b'{"status":"ok","id":%d}\n' % job.job_id)
 
     async def handle_get(
         self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
     ):
-        jsonschema.validate(instance=instance, schema=get_schema)
+        get_schema_validator(instance) #type: ignore
         job = self.job_manager.get(instance["queues"])
         if job is not None:
             self.clients[address].add(job.job_id)
             job_as_json = json.dumps(job.job).encode("utf-8")
             writer.write(
-                b'{"status":"ok","id":%d,"job":%s,"pri":123,"queue":"%s"}\n'
-                % (job.job_id, job_as_json, job.queue.encode("utf-8"))
+                b'{"status":"ok","id":%d,"job":%s,"pri":%d,"queue":"%s"}\n'
+                % (job.job_id, job_as_json, job.priority, job.queue.encode("utf-8"))
             )
             return
+
         if instance.get('wait', False):
-            # The client has asked the server not to respond until a job appears
-            pass
+            # Crude solution, poll every 1 second to see if a new job has been added
+            # A better way is to keep a list of waiters, and when a new job is inserted
+            # If a waiter is present, send it to the waiter instead of adding it to the
+            # queue
+            while job is None:
+                job = self.job_manager.get(instance["queues"])
+                await asyncio.sleep(0.5)
+            self.clients[address].add(job.job_id)
+            job_as_json = json.dumps(job.job).encode("utf-8")
+            writer.write(
+                b'{"status":"ok","id":%d,"job":%s,"pri":%d,"queue":"%s"}\n'
+                % (job.job_id, job_as_json, job.priority, job.queue.encode("utf-8"))
+            )
         else:
             writer.write(b'{"status":"no-job"}\n')
 
     async def handle_delete(
         self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
     ):
-        jsonschema.validate(instance=instance, schema=abort_delete_schema)
+        abort_delete_schema_validator(instance) #type: ignore
         status = self.job_manager.delete(instance["id"])
         if not status:
             writer.write(b'{"status":"no-job"}\n')
@@ -258,7 +275,7 @@ class Server:
     async def handle_abort(
         self, address: str, writer: asyncio.StreamWriter, instance: Dict[Any, Any]
     ):
-        jsonschema.validate(instance=instance, schema=abort_delete_schema)
+        abort_delete_schema_validator(instance) #type: ignore
         # Check if this is a valid job id
         if not self.job_manager.is_valid(instance["id"]):
             writer.write(b'{"status":"no-job"}\n')
@@ -304,7 +321,7 @@ class Server:
         # Load and validate the data
         try:
             instance = json.loads(data)
-            jsonschema.validate(instance=instance, schema=request_schema)
+            request_schema_validator(instance) #type: ignore
             # Instance is a valid request and has a request field
             if instance["request"] == "get":
                 await self.handle_get(address, writer, instance)
@@ -314,7 +331,7 @@ class Server:
                 await self.handle_delete(address, writer, instance)
             else:
                 await self.handle_abort(address, writer, instance)
-        except ValidationError as e:
+        except fastjsonschema.JsonSchemaValueException as e:
             logger.warning("%s invalid request: %s", address, e.message)
             writer.write(
                 b'{"status": "error", "error": "%s"}\n' % e.message.encode("utf-8")
