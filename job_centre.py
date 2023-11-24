@@ -91,30 +91,32 @@ class Job:
         """
         return self.priority > other.priority
 
+class State:
+    """
+    A class which holds global state required for this application
+    """
+    def __init__(self) -> None:
+        # Associates a queue name (string) with a heap(implemented as a list)
+        self.queues: Dict[str, list[Job]] = dict()
 
+        # Dictionary of jobs, job_id: job
+        self.jobs: Dict[int, Job] = dict()
 
-# Associates a queue name (string) with a heap(implemented as a list)
-queues: Dict[str, list[Job]] = dict()
-
-# Dictionary of jobs, job_id: job
-jobs: Dict[int, Job] = dict()
-
-
-def put(queue_name: str, job_dict: Dict[Any, Any], priority: int) -> Job:
+def put(state: State, queue_name: str, job_dict: Dict[Any, Any], priority: int) -> Job:
     """
     Puts the job on the specified queue and returns the job object
     """
 
-    if queue_name not in queues:
+    if queue_name not in state.queues:
         # Create an empty job queue
-        queues[queue_name] = []
+        state.queues[queue_name] = []
 
     job = Job.create(job_dict, priority, queue_name)
-    heapq.heappush(queues[queue_name], job)
-    jobs[job.job_id] = job
+    heapq.heappush(state.queues[queue_name], job)
+    state.jobs[job.job_id] = job
     return job
 
-def get(queues_list: list[str]):
+def get(state: State, queues_list: list[str]):
     """
     Returns the job with the highest priority among all the 
     given queues. If no job is found, None is returned
@@ -128,18 +130,18 @@ def get(queues_list: list[str]):
     highest_priority_job: Job | None = None
     for queue in queues_list:
         # Check if the queue exists and is not empty
-        if queue in queues and queues[queue]:
+        if queue in state.queues and state.queues[queue]:
             # Find the element with highest priority in this queue
-            job = heapq.heappop(queues[queue])
+            job = heapq.heappop(state.queues[queue])
             flag = False
 
             # Loop until the first non deleted job is found
             while job.deleted:
-                if not queues[queue]: # The queue is empty
-                    del queues[queue]
+                if not state.queues[queue]: # The queue is empty
+                    del state.queues[queue]
                     flag = True
                     break
-                job = heapq.heappop(queues[queue])
+                job = heapq.heappop(state.queues[queue])
             
             if flag:
                 break
@@ -149,56 +151,45 @@ def get(queues_list: list[str]):
                 highest_priority_job = job
             
             # Push the job back into the queue
-            heapq.heappush(queues[queue], job)
+            heapq.heappush(state.queues[queue], job)
     
     if highest_priority_job is None:
         return None
 
-    return heapq.heappop(queues[highest_priority_job.queue])
+    return heapq.heappop(state.queues[highest_priority_job.queue])
 
-def delete(job_id: int):
+def delete(state: State, job_id: int):
     """
     Returns True if the delete is valid
     False otherwise
     """
     # Check if the job has already been deleted
-    if job_id not in jobs:
+    if job_id not in state.jobs:
         return False
     
     # Check if the job id has not been allocated
     if job_id > job_id_counter:
         return False
 
-    jobs[job_id].deleted = True
-    del jobs[job_id]
+    state.jobs[job_id].deleted = True
+    del state.jobs[job_id]
     return True
 
-def abort(job_id: int):
+def abort(state: State, job_id: int):
     # Check if the job has been deleted
-    if job_id not in jobs:
+    if job_id not in state.jobs:
         return False
 
     # Check if the job id has not been allocated
     if job_id > job_id_counter:
         return False
     
-    job = jobs[job_id]
+    job = state.jobs[job_id]
     job.running = False
 
     # Put the job back in its queue
-    if job.queue not in queues:
+    if job.queue not in state.queues:
         # Create an empty job queue
-        queues[job.queue] = []
-    heapq.heappush(queues[job.queue], job)
+        state.queues[job.queue] = []
+    heapq.heappush(state.queues[job.queue], job)
     return True
-
-put("test", {"key1": "value1"}, 3)
-put("test", {"key2": "value2"}, 2)
-put("test", {"key3": "value3"}, 10)
-put("test", {"key4": "value4"}, 6)
-put("test1", {"keykk": "value1"}, 8)
-put("test2", {"zzd": "mew"}, 20)
-put("test2", {"zzds": "mew"}, 20)
-put("nothing", {"cat": "meow"}, 5)
-put("test", {"cat": "meow"}, 3)
-print(queues)
