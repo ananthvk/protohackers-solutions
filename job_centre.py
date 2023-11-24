@@ -1,6 +1,5 @@
 import os
-import sys
-import traceback
+import json
 
 os.environ["PYTHONASYNCIODEBUG"] = "1"
 import logging
@@ -139,7 +138,6 @@ class JobManager:
         Returns the job with the highest priority among all the
         given queues. If no job is found, None is returned
         """
-        # TODO: Check for deleted jobs
 
         if queues_list is None:
             return None
@@ -213,19 +211,80 @@ class JobManager:
         return True
 
 
-async def client_accepted(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+job_manager = JobManager()
+
+
+async def client_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    address = ""
     try:
         address = writer.get_extra_info("peername")
-        address = f'{address[0]}:{address[1]}'
+        address = f"{address[0]}:{address[1]}"
         logger.info("%s connected", address)
         while True:
             data = await reader.readline()
             if not data:
+                logger.info("%s disconnected", address)
                 break
-            writer.write(data)
+            logger.info("%s sent %s", address, data)
+
+            # Load and validate the data
+            try:
+                instance = json.loads(data)
+                jsonschema.validate(instance=instance, schema=request_schema)
+                # Instance is a valid request and has a request field
+                if instance["request"] == "get":
+                    jsonschema.validate(instance=instance, schema=get_schema)
+                    job = job_manager.get(instance["queues"])
+                    if job is None:
+                        writer.write(b'{"status":"no-job"}\n')
+                    else:
+                        job_as_json = json.dumps(job.job).encode('utf-8')
+                        writer.write(
+                            b'{"status":"ok","id":%d,"job":%s,"pri":123,"queue":"%s"}\n'
+                            % (job.job_id, job_as_json, job.queue.encode('utf-8'))
+                        )
+
+                elif instance["request"] == "put":
+                    jsonschema.validate(instance=instance, schema=put_schema)
+                    job = job_manager.put(
+                        instance["queue"], instance["job"], instance["pri"]
+                    )
+                    writer.write(b'{"status":"ok","id":%d}\n' % job.job_id)
+
+                else:
+                    jsonschema.validate(instance=instance, schema=abort_delete_schema)
+                    if instance["request"] == "delete":
+                        status = job_manager.delete(instance["id"])
+                        if not status:
+                            writer.write(b'{"status":"no-job"}\n')
+                        else:
+                            writer.write(b'{"status":"ok"}\n')
+                    else:
+                        status = job_manager.abort(instance["id"])
+                        if not status:
+                            writer.write(b'{"status":"no-job"}\n')
+                        else:
+                            writer.write(b'{"status":"ok"}\n')
+
+            except ValidationError as e:
+                logger.warning("%s invalid request: %s", address, e.message)
+                writer.write(
+                    b'{"status": "error", "error": "%s"}\n' % e.message.encode("utf-8")
+                )
+            except json.JSONDecodeError as e:
+                logger.warning("%s illformated json: %s", address, e.msg)
+                writer.write(
+                    b'{"status": "error", "error": "%s"}\n' % e.msg.encode("utf-8")
+                )
+
+            except Exception as e:
+                logger.critical("%s unhandled exception", address, exc_info=1)  # type: ignore
+                writer.write(b'{"status": "error", "error": "unhandled exception"}\n')
+
             await writer.drain()
     except:
-        print("ERROR: ", traceback.format_exc())
+        logger.exception("%s error occured while handling client", address)
+
     finally:
         try:
             writer.close()
@@ -241,7 +300,7 @@ async def main():
     loop.set_debug(True)
     logging.getLogger("asyncio").setLevel(logging.DEBUG)
     logger.info("This is from logger")
-    server = await asyncio.start_server(client_accepted, host=HOST, port=PORT)
+    server = await asyncio.start_server(client_handler, host=HOST, port=PORT)
     logger.info("Started server on %s:%d", HOST, PORT)
     async with server:
         await server.serve_forever()
@@ -249,3 +308,6 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+# TODO: Implement wait in get request, refactor the requests to reduce that many if-elses
+# TODO: Associate a client with abort and get requests
